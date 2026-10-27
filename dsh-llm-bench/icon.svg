@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Context bench gauge">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1b2a4a"/>
+  <path d="M14 42a18 18 0 0 1 36 0" fill="none" stroke="#4c7dff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M14 42a18 18 0 0 1 9-15.6" fill="none" stroke="#7fe0c0" stroke-width="5" stroke-linecap="round"/>
+  <path d="M41 26.4A18 18 0 0 1 50 42" fill="none" stroke="#ffb45c" stroke-width="5" stroke-linecap="round"/>
+  <path d="M32 42l9-11" fill="none" stroke="#f2f5ff" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="32" cy="42" r="4" fill="#f2f5ff"/>
+  <g fill="#7fe0c0">
+    <rect x="18" y="49" width="6" height="4" rx="1"/>
+    <rect x="27" y="49" width="12" height="4" rx="1"/>
+    <rect x="42" y="49" width="4" height="4" rx="1"/>
+  </g>
+</svg>

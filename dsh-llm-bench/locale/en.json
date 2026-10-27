@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Model Context Bench",
+    "description": "Measures model speed at several context sizes, probes the largest usable context, and generates synthetic context to test both."
+  }
+}

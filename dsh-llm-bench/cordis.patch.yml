@@ -1,0 +1,3 @@
+- insert:
+    - id: llm-bench
+      name: '@local/dsh-llm-bench'
