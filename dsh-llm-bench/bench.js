@@ -357,6 +357,7 @@ export async function runSweep(request) {
         signal: request.signal,
       })
       if (result.charsPerTokenMeasured !== null) ratio = result.charsPerTokenMeasured
+      if (result.finishKind === 'aborted') throw request.signal?.reason ?? new Error('aborted')
       emit({ type: 'run', result })
       results.push(result)
       if (classifyFailure(result.failure) === 'fatal') {
@@ -400,6 +401,7 @@ export async function probeMaxContext(request) {
       signal: request.signal,
     })
     if (result.charsPerTokenMeasured !== null) ratio = result.charsPerTokenMeasured
+    if (result.finishKind === 'aborted') throw request.signal?.reason ?? new Error('aborted')
     const kind = result.ok ? 'pass' : classifyFailure(result.failure)
     const step = {
       probe: stepIndex,

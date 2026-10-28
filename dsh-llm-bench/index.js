@@ -314,75 +314,288 @@ function toolDefinition(ctx) {
         }
       }
       if (action === 'sweep') {
-        const sizes = normalizeSizes(args.sizes)
-        const outputTokens = Math.max(1, Math.min(DEFAULTS.maxOutputTokens, Math.round(Number(args.outputTokens ?? DEFAULTS.outputTokens))))
-        return withBenchmarkLock(exec, async (signal) => {
-          const results = await runSweep({
-            llm: ctx.llm,
-            provider: route.provider,
-            model: route.model,
-            sizes,
-            outputTokens,
-            repeats: args.repeats,
-            needle: args.needle,
-            signal,
-          })
-          return {
-            action,
-            ...route,
-            declaredContextWindow: info.declaredContextWindow,
-            results,
-            summary: { action, outputTokens },
-          }
+        normalizeSizes(args.sizes)
+        const snapshot = await runThroughTool(ctx, exec, {
+          action: 'sweep',
+          provider: route.provider,
+          model: route.model,
+          sizes: args.sizes,
+          outputTokens: args.outputTokens,
+          repeats: args.repeats,
+          needle: args.needle,
         })
+        return {
+          action,
+          ...route,
+          declaredContextWindow: snapshot.declaredContextWindow,
+          results: snapshot.results,
+          summary: snapshot.summary,
+        }
       }
       if (action === 'probe') {
-        const ceiling = Math.max(
-          1024,
-          Math.min(
-            DEFAULTS.hardMaxTokens,
-            Math.round(Number(args.ceilingTokens ?? info.declaredContextWindow ?? 262_144)),
-          ),
-        )
-        return withBenchmarkLock(exec, async (signal) => {
-          const summary = await probeMaxContext({
-            llm: ctx.llm,
-            provider: route.provider,
-            model: route.model,
-            ceilingTokens: ceiling,
-            toleranceTokens: args.toleranceTokens,
-            maxProbes: args.maxProbes,
-            signal,
-          })
-          return { action, ...route, declaredContextWindow: info.declaredContextWindow, summary }
+        const snapshot = await runThroughTool(ctx, exec, {
+          action: 'probe',
+          provider: route.provider,
+          model: route.model,
+          ceilingTokens: args.ceilingTokens ?? info.declaredContextWindow ?? 262_144,
+          toleranceTokens: args.toleranceTokens,
+          maxProbes: args.maxProbes,
         })
+        return { action, ...route, declaredContextWindow: snapshot.declaredContextWindow, summary: snapshot.summary }
       }
       throw new Error(`Unknown action "${action}". Use catalog, sweep, probe, or generate.`)
     },
   }
 }
 
+/** Run events kept for replay, so a reader that re-attaches can rebuild the panel. */
+const MAX_RUN_EVENTS = 400
+
 /**
- * Serialize measurements across the agent tool and the Settings page: two
- * overlapping benchmarks would measure each other instead of the model.
- * @param exec - tool execution whose cancellation also stops the model calls.
- * @param operation - the measurement run, given the shared abort signal.
- * @returns the operation result.
+ * The most recent run. It lives outside every HTTP request: a reader closing its
+ * stream detaches, it does not stop the measurement, so the panel can be left,
+ * gone back to, or reloaded while a sweep keeps going.
  */
-async function withBenchmarkLock(exec, operation) {
-  if (activeRun !== null) {
-    throw new Error('Another benchmark is already running; wait for it to finish, or stop it from the Model Bench page.')
+let current = null
+let nextRunId = 1
+
+/** Snapshot of a run that never existed. */
+function emptySnapshot() {
+  return {
+    runId: null,
+    status: 'idle',
+    action: null,
+    provider: null,
+    model: null,
+    declaredContextWindow: null,
+    results: [],
+    steps: [],
+    summary: null,
+    error: null,
+    progress: null,
+    startedAt: null,
+    endedAt: null,
+    lastSeq: -1,
   }
-  const controller = new AbortController()
-  activeRun = controller
-  const relay = () => controller.abort(exec.signal.reason)
-  exec.signal.addEventListener('abort', relay)
+}
+
+/**
+ * Project one run into the shape a reader renders from.
+ * @param run - the run, or null before any run happened.
+ * @returns a detached JSON-safe snapshot.
+ */
+function snapshotOf(run) {
+  if (run === null) return emptySnapshot()
+  return {
+    runId: run.id,
+    status: run.status,
+    action: run.action,
+    provider: run.provider,
+    model: run.model,
+    declaredContextWindow: run.declaredContextWindow,
+    results: run.results,
+    steps: run.steps,
+    summary: run.summary,
+    error: run.error,
+    progress: run.progress,
+    startedAt: run.startedAt,
+    endedAt: run.endedAt,
+    lastSeq: run.nextSeq - 1,
+  }
+}
+
+/**
+ * Fold one event into the run's own state, so a reader that arrives late sees the
+ * same numbers as one that watched from the start.
+ * @param run - the run receiving the event.
+ * @param event - the event payload.
+ */
+function applyEvent(run, event) {
+  switch (event.type) {
+    case 'start':
+      run.declaredContextWindow = typeof event.declaredContextWindow === 'number' ? event.declaredContextWindow : null
+      run.progress = { kind: 'start' }
+      break
+    case 'run-start':
+      run.progress = { kind: 'run', index: event.index, total: event.total, targetTokens: event.targetTokens }
+      break
+    case 'run':
+      run.results.push(event.result)
+      run.progress = { kind: 'ran', targetTokens: event.result.targetTokens, ttftMs: event.result.ttftMs }
+      break
+    case 'probe-start':
+      run.progress = { kind: 'probe', probe: event.probe, of: event.of, targetTokens: event.targetTokens }
+      break
+    case 'probe':
+      run.steps.push(event.step)
+      run.progress = { kind: 'probed', probe: event.step.probe, outcome: event.step.outcome }
+      break
+    case 'summary':
+      run.summary = event.summary
+      break
+    case 'error':
+      run.error = event.message
+      break
+    case 'done':
+      run.status = typeof event.status === 'string' ? event.status : 'done'
+      run.endedAt = Date.now()
+      run.progress = null
+      break
+    default:
+      break
+  }
+}
+
+/**
+ * Append one event to the run log and hand it to every attached reader.
+ * @param run - the run that produced it.
+ * @param event - the event payload.
+ */
+function publish(run, event) {
+  const entry = { runId: run.id, seq: run.nextSeq, event }
+  run.nextSeq += 1
+  applyEvent(run, event)
+  run.log.push(entry)
+  if (run.log.length > MAX_RUN_EVENTS) run.log.shift()
+  for (const reader of [...run.readers]) reader(entry)
+}
+
+/** True while a measurement holds the model's attention. */
+function isBusy() {
+  return current !== null && current.status === 'running'
+}
+
+/**
+ * Drive one run to completion, publishing every step as it happens.
+ * @param run - the run record to fill.
+ * @param spec - resolved route, action, and validated parameters.
+ */
+async function executeRun(run, spec) {
+  const emit = (event) => publish(run, event)
   try {
-    return await operation(controller.signal)
-  } finally {
-    exec.signal.removeEventListener('abort', relay)
-    activeRun = null
+    publish(run, {
+      type: 'start',
+      action: run.action,
+      provider: run.provider,
+      model: run.model,
+      declaredContextWindow: spec.declaredContextWindow ?? null,
+    })
+    if (run.action === 'sweep') {
+      await runSweep({
+        llm: spec.llm,
+        provider: run.provider,
+        model: run.model,
+        sizes: spec.sizes,
+        outputTokens: spec.outputTokens,
+        repeats: spec.repeats,
+        needle: spec.needle,
+        signal: run.controller.signal,
+        emit,
+      })
+      publish(run, {
+        type: 'summary',
+        summary: { action: 'sweep', outputTokens: spec.outputTokens, repeats: spec.repeats, results: run.results },
+      })
+    } else {
+      await probeMaxContext({
+        llm: spec.llm,
+        provider: run.provider,
+        model: run.model,
+        ceilingTokens: spec.ceilingTokens,
+        toleranceTokens: spec.toleranceTokens,
+        maxProbes: spec.maxProbes,
+        signal: run.controller.signal,
+        emit,
+      })
+    }
+    publish(run, { type: 'done', status: run.controller.signal.aborted ? 'stopped' : 'done' })
+  } catch (error) {
+    const stopped = run.controller.signal.aborted
+    if (!stopped) publish(run, { type: 'error', message: error instanceof Error ? error.message : String(error) })
+    publish(run, { type: 'done', status: stopped ? 'stopped' : 'error' })
   }
+}
+
+/** Round one numeric input into its accepted range, ignoring garbage. */
+function clampInt(value, fallback, min, max) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.max(min, Math.min(max, Math.round(parsed)))
+}
+
+/**
+ * Resolve the route and start one measured run.
+ * @param ctx - plugin context.
+ * @param body - request or tool arguments.
+ * @param signal - optional external cancellation, such as a tool call being aborted.
+ * @returns the started run record.
+ */
+async function startRun(ctx, body, signal) {
+  if (isBusy()) throw new Error('Another benchmark is already running; stop it from the Model Bench panel or wait for it to finish.')
+  const action = body.action === 'probe' ? 'probe' : 'sweep'
+  const route = await resolveRoute(ctx, { provider: body.provider, model: body.model })
+  const info = await routeInfo(ctx.llm, route.provider, route.model)
+  const spec = {
+    action,
+    llm: ctx.llm,
+    provider: route.provider,
+    model: route.model,
+    declaredContextWindow: info.declaredContextWindow,
+  }
+  if (action === 'sweep') {
+    spec.sizes = normalizeSizes(body.sizes)
+    spec.outputTokens = clampInt(body.outputTokens, DEFAULTS.outputTokens, 1, DEFAULTS.maxOutputTokens)
+    spec.repeats = clampInt(body.repeats, DEFAULTS.repeats, 1, 5)
+    spec.needle = body.needle !== false
+  } else {
+    spec.ceilingTokens = clampInt(body.ceilingTokens, info.declaredContextWindow ?? 262_144, 1024, DEFAULTS.hardMaxTokens)
+    spec.toleranceTokens = clampInt(body.toleranceTokens, DEFAULTS.toleranceTokens, 64, 1_000_000)
+    spec.maxProbes = clampInt(body.maxProbes, DEFAULTS.maxProbes, 1, 24)
+  }
+  const run = {
+    id: nextRunId,
+    action,
+    provider: route.provider,
+    model: route.model,
+    declaredContextWindow: spec.declaredContextWindow,
+    status: 'running',
+    startedAt: Date.now(),
+    endedAt: null,
+    results: [],
+    steps: [],
+    summary: null,
+    error: null,
+    progress: null,
+    log: [],
+    nextSeq: 0,
+    readers: new Set(),
+    controller: new AbortController(),
+    done: null,
+  }
+  nextRunId += 1
+  current = run
+  if (signal !== undefined) {
+    const relay = () => run.controller.abort(signal.reason)
+    if (signal.aborted) relay()
+    else signal.addEventListener('abort', relay, { once: true })
+  }
+  run.done = executeRun(run, spec)
+  return run
+}
+
+/**
+ * Run one benchmark for the agent tool and wait for its outcome.
+ * @param ctx - plugin context.
+ * @param exec - tool execution, whose cancellation stops the run.
+ * @param body - tool arguments.
+ * @returns the finished run snapshot.
+ */
+async function runThroughTool(ctx, exec, body) {
+  const run = await startRun(ctx, body, exec.signal)
+  const snapshot = await run.done.then(() => snapshotOf(run))
+  if (snapshot.status === 'stopped') throw new Error('The benchmark was stopped before it finished.')
+  if (snapshot.error !== null) throw new Error(snapshot.error)
+  return snapshot
 }
 
 /** Reject a request whose browser Origin belongs to another site. */
@@ -420,11 +633,24 @@ async function readJsonBody(request) {
   return text.length === 0 ? {} : JSON.parse(text)
 }
 
+/** One route guard shared by the write endpoints. */
+function guardWrite(request, response) {
+  if (request.method !== 'POST') {
+    sendJson(response, 405, { error: 'use POST' })
+    return false
+  }
+  if (!trustedRequest(request)) {
+    sendJson(response, 403, { error: 'untrusted origin' })
+    return false
+  }
+  return true
+}
+
 /**
  * Register the benchmark endpoints on the Host web server.
  * @param ctx - plugin context.
  * @param webServer - Host web server service.
- * @returns one disposer for both routes.
+ * @returns one disposer for every route.
  */
 function mountRoutes(ctx, webServer) {
   const catalog = webServer.register({
@@ -462,18 +688,22 @@ function mountRoutes(ctx, webServer) {
       }
     },
   })
+  const state = webServer.register({
+    kind: 'exact',
+    path: '/api/llm-bench/state',
+    handler: (request, response) => {
+      if (request.method !== 'GET') {
+        sendJson(response, 405, { error: 'use GET' })
+        return
+      }
+      sendJson(response, 200, snapshotOf(current))
+    },
+  })
   const run = webServer.register({
     kind: 'exact',
     path: '/api/llm-bench/run',
     handler: async (request, response) => {
-      if (request.method !== 'POST') {
-        sendJson(response, 405, { error: 'use POST' })
-        return
-      }
-      if (!trustedRequest(request)) {
-        sendJson(response, 403, { error: 'untrusted origin' })
-        return
-      }
+      if (!guardWrite(request, response)) return
       let body
       try {
         body = await readJsonBody(request)
@@ -481,85 +711,78 @@ function mountRoutes(ctx, webServer) {
         sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
         return
       }
-      if (activeRun !== null) {
-        sendJson(response, 409, { error: 'another benchmark is already running; stop it first' })
+      if (isBusy()) {
+        sendJson(response, 409, { error: 'another benchmark is already running; stop it first', runId: current.id })
         return
       }
-      const controller = new AbortController()
-      activeRun = controller
+      try {
+        const started = await startRun(ctx, body)
+        sendJson(response, 202, snapshotOf(started))
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  })
+  const events = webServer.register({
+    kind: 'exact',
+    path: '/api/llm-bench/events',
+    handler: (request, response) => {
+      if (request.method !== 'GET') {
+        sendJson(response, 405, { error: 'use GET' })
+        return
+      }
+      const snapshot = current
+      if (snapshot === null) {
+        sendJson(response, 404, { error: 'no benchmark has run yet' })
+        return
+      }
+      const url = new URL(request.url ?? '/', 'http://localhost')
+      const from = clampInt(url.searchParams.get('from'), 0, 0, Number.MAX_SAFE_INTEGER)
       response.writeHead(200, {
         'cache-control': 'no-store',
         'content-type': 'application/x-ndjson; charset=utf-8',
         'x-accel-buffering': 'no',
       })
-      const emit = (event) => {
-        if (!response.writableEnded) response.write(`${JSON.stringify(event)}\n`)
+      const send = (entry) => {
+        if (response.writableEnded) return
+        response.write(`${JSON.stringify(entry)}\n`)
+        if (entry.event.type === 'done') response.end()
       }
-      response.on('close', () => {
-        if (!response.writableEnded) controller.abort(new Error('benchmark stopped by the page'))
-      })
-      try {
-        const action = body.action === 'probe' ? 'probe' : 'sweep'
-        const route = await resolveRoute(ctx, {
-          provider: body.provider,
-          model: body.model,
-        })
-        const info = await routeInfo(ctx.llm, route.provider, route.model)
-        emit({
-          type: 'start',
-          action,
-          provider: route.provider,
-          model: route.model,
-          declaredContextWindow: info.declaredContextWindow,
-        })
-        if (action === 'sweep') {
-          const sizes = normalizeSizes(body.sizes)
-          const outputTokens = Math.max(1, Math.min(DEFAULTS.maxOutputTokens, Math.round(Number(body.outputTokens ?? DEFAULTS.outputTokens))))
-          const repeats = Math.max(1, Math.min(5, Math.round(Number(body.repeats ?? 1))))
-          const results = await runSweep({
-            llm: ctx.llm,
-            provider: route.provider,
-            model: route.model,
-            sizes,
-            outputTokens,
-            repeats,
-            needle: body.needle !== false,
-            signal: controller.signal,
-            emit,
-          })
-          emit({ type: 'summary', summary: { action, outputTokens, repeats, results } })
-        } else {
-          await probeMaxContext({
-            llm: ctx.llm,
-            provider: route.provider,
-            model: route.model,
-            ceilingTokens: Math.max(1024, Math.min(DEFAULTS.hardMaxTokens, Math.round(Number(body.ceilingTokens ?? info.declaredContextWindow ?? 262_144)))),
-            toleranceTokens: body.toleranceTokens,
-            maxProbes: body.maxProbes,
-            signal: controller.signal,
-            emit,
-          })
-        }
-        emit({ type: 'done' })
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          emit({ type: 'error', message: error instanceof Error ? error.message : String(error) })
-        }
-      } finally {
-        activeRun = null
+      for (const entry of snapshot.log) if (entry.seq >= from) send(entry)
+      if (snapshot.status !== 'running') {
         if (!response.writableEnded) response.end()
+        return
       }
+      snapshot.readers.add(send)
+      response.on('close', () => snapshot.readers.delete(send))
+    },
+  })
+  const stop = webServer.register({
+    kind: 'exact',
+    path: '/api/llm-bench/stop',
+    handler: (request, response) => {
+      if (!guardWrite(request, response)) return
+      if (!isBusy()) {
+        sendJson(response, 200, { ok: false, status: current === null ? 'idle' : current.status })
+        return
+      }
+      current.controller.abort(new Error('stopped from the Model Bench panel'))
+      sendJson(response, 200, { ok: true, runId: current.id })
     },
   })
   return () => {
     catalog()
+    state()
     run()
+    events()
+    stop()
   }
 }
 
 /**
  * Activate the Host half: agent tool plus, when the web server is present,
- * the Settings page endpoints.
+ * the panel endpoints. Runs outlive their readers, so the panel is a view of
+ * Host state rather than the owner of it.
  * @param ctx - plugin context.
  */
 export function apply(ctx) {

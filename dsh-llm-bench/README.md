@@ -22,10 +22,29 @@ Both drive `bench.js`, so the agent and the page report identical numbers.
 
 - **Agent tool `llm_bench`** — actions `catalog`, `sweep`, `probe`, `generate`.
 - **Sidebar panel (Model Bench)** — the same sweeps and probes with a live table, a stop
-  button, and a JSON copy of the last run. It is its own main-column panel, not a Settings
-  page: the last run stays on screen when you open it again, and inputs plus results are
-  written to `localStorage` (`dsh-llm-bench:v1`) and restored after a page reload. Switching
-  to another panel stops a running measurement; what it collected so far is kept.
+  button, and a JSON copy of the last run.
+
+## The run belongs to the Host, not to the panel
+
+Starting a benchmark creates a run on the Host and returns immediately; the panel is only a
+reader of it. That is what makes the panel safe to leave:
+
+- Closing the panel, opening another one, or reloading the page **detaches the reader, not
+  the measurement**. The sweep keeps going, and the status line of the panel rebuilds from
+  the Host the moment it is opened again.
+- A run started by the agent tool is visible in the panel for the same reason, and vice
+  versa: both use the same run slot, and only one measurement runs at a time.
+- `Stop` aborts the run on the Host; the panel shows the run as stopped, with the rows it
+  had already collected.
+- The Host keeps one event log per run, so a reader that arrives late replays what it
+  missed instead of starting from an empty table.
+- The last finished run (plus the form) is also mirrored to `localStorage`
+  (`dsh-llm-bench:v2`) and restored when the Host itself restarted and has no run in
+  memory — labelled as restored in the panel.
+
+Endpoints, all same-origin under `/api/llm-bench`: `GET catalog`, `GET state`,
+`POST run` (202 with the run snapshot; 409 while another run is active),
+`GET events?from=N` (NDJSON: backlog first, then live, ending at `done`), `POST stop`.
 
 ## What is measured
 

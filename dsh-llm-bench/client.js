@@ -1,7 +1,9 @@
 /**
- * Model Context Bench, browser half: a side panel, registered like every other
- * sidebar entry, that drives the Host benchmark endpoints and keeps its results
- * while the panel is closed (and across a page reload, via localStorage).
+ * Model Context Bench, browser half: a side panel that shows a run owned by the
+ * Host. Closing the panel, opening another one, or reloading the page detaches
+ * this view; it never stops the measurement, and re-opening replays whatever it
+ * missed. The last finished run is also kept in localStorage for the case where
+ * the Host itself restarted.
  *
  * Plain-JS client module: `React` comes from the browser module table, all
  * controls are local, and every color comes from a `--dsw-alias-*` theme token.
@@ -17,8 +19,8 @@ window.__ModuleLoader__.load({
     const NS = 'llm-bench'
     /** Sidebar entry id and `main` key; the shell routes one to the other. */
     const PANEL_ID = 'llm-bench'
-    /** Local persistence so closing the panel or reloading the page keeps the last run. */
-    const STORE_KEY = 'dsh-llm-bench:v1'
+    /** Where the form and the last finished run survive a Host restart. */
+    const STORE_KEY = 'dsh-llm-bench:v2'
 
     const en = {
       nav: 'Model Bench',
@@ -39,12 +41,13 @@ window.__ModuleLoader__.load({
       probe: 'Find max context',
       stop: 'Stop',
       clear: 'Clear results',
-      starting: 'Starting…',
+      starting: 'starting…',
       unavailable: 'The benchmark endpoints are not answering. Is the host half of this plugin loaded?',
       invalidSizes: 'Enter context sizes as numbers of at least 256 tokens.',
       noRoute: 'Choose a provider and model first.',
+      busy: 'Another benchmark is already running; showing that run instead.',
       results: 'Measurements',
-      noResults: 'No measurements yet. Results stay here while the panel is closed.',
+      noResults: 'No measurements yet. Runs keep going while you work elsewhere.',
       maxContext: 'Max context',
       firstFailing: 'First failing target',
       requestedTarget: 'Requested target',
@@ -54,7 +57,9 @@ window.__ModuleLoader__.load({
       copy: 'Copy JSON',
       copied: 'Copied',
       costNote: 'Every run sends real input tokens to the provider and is billed; a probe near a large ceiling sends millions of tokens.',
-      leavingHint: 'Switching to another panel stops a running measurement; what it collected so far stays here.',
+      runKeepsHint: 'The run continues on the host while you use other panels; reopen this one to see it finish.',
+      restored: 'Restored from this browser — the host has no run in memory.',
+      stoppedHint: 'Stopped before it finished; the numbers below are partial.',
       colTarget: 'Target',
       colActual: 'Actual',
       colTtft: 'TTFT',
@@ -75,7 +80,6 @@ window.__ModuleLoader__.load({
       recallNone: '—',
       probeOf: 'probe',
       ofProbes: 'of',
-      onRoute: 'on',
       prefillNote: 'Prefill is input tokens over time to first token, so it includes provider queueing and transport. Decode is output tokens over the time between the first and last returned token.',
       probeAborted: 'The search stopped on a failure that is not about size, so these results are partial.',
       ceilingHint: 'The ceiling itself passed, so the real limit is higher. Raise the probe ceiling to push further.',
@@ -142,7 +146,7 @@ window.__ModuleLoader__.load({
       '.llmb-meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--dsw-alias-label-secondary);font-size:12px;font-variant-numeric:tabular-nums}',
     ].join('')
 
-    /** Read the last persisted run, tolerating absent or corrupt storage. */
+    /** Read the persisted form and last run, tolerating absent or corrupt storage. */
     function readStore() {
       try {
         const raw = window.localStorage.getItem(STORE_KEY)
@@ -154,7 +158,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Persist the panel's inputs and results; storage failures are non-fatal. */
+    /** Persist the form and the last finished run; storage failures are non-fatal. */
     function writeStore(value) {
       try {
         window.localStorage.setItem(STORE_KEY, JSON.stringify(value))
@@ -192,41 +196,53 @@ window.__ModuleLoader__.load({
       return unique.slice(0, 16)
     }
 
-    /** Read one NDJSON event stream from the Host and dispatch every event. */
-    async function streamRun(body, onEvent, signal) {
-      const response = await fetch('/api/llm-bench/run', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        signal,
-      })
-      if (!response.ok) {
-        let message = `HTTP ${response.status}`
-        try {
-          const detail = await response.json()
-          if (detail !== null && typeof detail === 'object' && typeof detail.error === 'string') message = detail.error
-        } catch (ignored) {
-          /* keep the status line */
-        }
-        throw new Error(message)
+    /** The idle run shape, so rendering never has to branch on "no run at all". */
+    function idleRun() {
+      return {
+        runId: null,
+        status: 'idle',
+        results: [],
+        steps: [],
+        summary: null,
+        error: null,
+        progress: null,
+        declaredContextWindow: null,
       }
-      if (response.body === null) throw new Error('this browser cannot read a streamed response')
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let newline = buffer.indexOf('\n')
-        while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim()
-          buffer = buffer.slice(newline + 1)
-          if (line.length > 0) onEvent(JSON.parse(line))
-          newline = buffer.indexOf('\n')
-        }
+    }
+
+    /**
+     * Fold one Host event into the panel's copy of the run, mirroring the Host's
+     * own fold so a replayed stream and a live one land in the same shape.
+     * @param previous - the run as currently rendered.
+     * @param event - one event from the Host stream.
+     * @returns the updated run.
+     */
+    function reduceEvent(previous, event) {
+      const run = previous ?? idleRun()
+      switch (event.type) {
+        case 'start':
+          return { ...run, status: 'running', error: null, progress: { kind: 'start' }, declaredContextWindow: event.declaredContextWindow ?? null }
+        case 'run-start':
+          return { ...run, progress: { kind: 'run', index: event.index, total: event.total, targetTokens: event.targetTokens } }
+        case 'run':
+          return {
+            ...run,
+            results: [...run.results, event.result],
+            progress: { kind: 'ran', targetTokens: event.result.targetTokens, ttftMs: event.result.ttftMs },
+          }
+        case 'probe-start':
+          return { ...run, progress: { kind: 'probe', probe: event.probe, of: event.of, targetTokens: event.targetTokens } }
+        case 'probe':
+          return { ...run, steps: [...run.steps, event.step], progress: { kind: 'probed', probe: event.step.probe, outcome: event.step.outcome } }
+        case 'summary':
+          return { ...run, summary: event.summary }
+        case 'error':
+          return { ...run, error: event.message }
+        case 'done':
+          return { ...run, status: typeof event.status === 'string' ? event.status : 'done', progress: null }
+        default:
+          return run
       }
-      if (buffer.trim().length > 0) onEvent(JSON.parse(buffer))
     }
 
     /** One table cell for the measurement status. */
@@ -302,8 +318,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Render the bisection outcome and its probe steps. */
-    function ProbeSummary({ summary, liveSteps, declaredWindow }) {
-      const steps = Array.isArray(summary?.steps) ? summary.steps : liveSteps
+    function ProbeSummary({ summary, steps, declaredWindow }) {
       const measured = summary === null ? null : typeof summary.maxInputTokens === 'number' ? summary.maxInputTokens : null
       const figure = summary === null
         ? null
@@ -385,38 +400,98 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** Human-readable status line for whatever the run is doing right now. */
+    function progressText(progress) {
+      if (progress === null || progress === undefined) return null
+      if (progress.kind === 'start') return tr('starting')
+      if (progress.kind === 'run') return `${formatInt(progress.targetTokens)} ${tr('tokens')}…`
+      if (progress.kind === 'ran') return `${formatInt(progress.targetTokens)} ${tr('tokens')} · ${tr('colTtft')} ${formatMs(progress.ttftMs ?? null)}`
+      if (progress.kind === 'probe') {
+        return `${tr('probeOf')} ${progress.probe} ${tr('ofProbes')} ${progress.of}: ${formatInt(progress.targetTokens)} ${tr('tokens')}`
+      }
+      if (progress.kind === 'probed') {
+        return `${tr('probeOf')} ${progress.probe}: ${
+          progress.outcome === 'pass' ? tr('outcomePass') : progress.outcome === 'context' ? tr('outcomeContext') : tr('outcomeFatal')
+        }`
+      }
+      return null
+    }
+
     /**
-     * The panel: route selection, sweep and probe controls, results.
+     * The panel: route selection, sweep and probe controls, and the Host's run.
      * @returns the side panel element tree.
      */
     function Panel() {
       const [saved] = useState(readStore)
+      const savedForm = saved !== null && typeof saved.form === 'object' && saved.form !== null ? saved.form : {}
       const [catalog, setCatalog] = useState(null)
       const [loadError, setLoadError] = useState(null)
-      const [provider, setProvider] = useState(() => (typeof saved?.provider === 'string' ? saved.provider : ''))
-      const [model, setModel] = useState(() => (typeof saved?.model === 'string' ? saved.model : ''))
+      const [provider, setProvider] = useState(() => (typeof savedForm.provider === 'string' ? savedForm.provider : ''))
+      const [model, setModel] = useState(() => (typeof savedForm.model === 'string' ? savedForm.model : ''))
       const [sizesText, setSizesText] = useState(() =>
-        typeof saved?.sizesText === 'string' ? saved.sizesText : '1000, 4000, 16000, 64000',
+        typeof savedForm.sizesText === 'string' ? savedForm.sizesText : '1000, 4000, 16000, 64000',
       )
       const [outputTokens, setOutputTokens] = useState(() =>
-        typeof saved?.outputTokens === 'number' ? saved.outputTokens : 256,
+        typeof savedForm.outputTokens === 'number' ? savedForm.outputTokens : 256,
       )
-      const [repeats, setRepeats] = useState(() => (typeof saved?.repeats === 'number' ? saved.repeats : 1))
-      const [needle, setNeedle] = useState(() => (typeof saved?.needle === 'boolean' ? saved.needle : true))
-      const [ceilingText, setCeilingText] = useState(() => (typeof saved?.ceilingText === 'string' ? saved.ceilingText : ''))
-      const [tolerance, setTolerance] = useState(() => (typeof saved?.tolerance === 'number' ? saved.tolerance : 512))
-      const [results, setResults] = useState(() => (Array.isArray(saved?.results) ? saved.results : []))
-      const [summary, setSummary] = useState(() => (saved?.summary !== null && typeof saved?.summary === 'object' ? saved.summary : null))
-      const [steps, setSteps] = useState(() => (Array.isArray(saved?.steps) ? saved.steps : []))
-      const [declaredWindow, setDeclaredWindow] = useState(() =>
-        typeof saved?.declaredWindow === 'number' ? saved.declaredWindow : null,
-      )
-      const [running, setRunning] = useState(null)
-      const [progress, setProgress] = useState(null)
-      const [error, setError] = useState(null)
+      const [repeats, setRepeats] = useState(() => (typeof savedForm.repeats === 'number' ? savedForm.repeats : 1))
+      const [needle, setNeedle] = useState(() => (typeof savedForm.needle === 'boolean' ? savedForm.needle : true))
+      const [ceilingText, setCeilingText] = useState(() => (typeof savedForm.ceilingText === 'string' ? savedForm.ceilingText : ''))
+      const [tolerance, setTolerance] = useState(() => (typeof savedForm.tolerance === 'number' ? savedForm.tolerance : 512))
+      const [run, setRun] = useState(null)
+      const [restored, setRestored] = useState(false)
+      const [actionError, setActionError] = useState(null)
       const [copied, setCopied] = useState(false)
-      const abortRef = useRef(null)
+      const readerRef = useRef(null)
       const copiedTimer = useRef(null)
+
+      const applySnapshot = useCallback((snapshot, fromStore) => {
+        setRun({ ...idleRun(), ...snapshot })
+        setRestored(fromStore === true)
+      }, [])
+
+      /** Open the Host event stream for one run, from the first sequence still needed. */
+      const attach = useCallback(async (from, runId) => {
+        if (readerRef.current !== null) readerRef.current.abort()
+        const controller = new AbortController()
+        readerRef.current = controller
+        try {
+          const response = await fetch(`/api/llm-bench/events?from=${from}`, { cache: 'no-store', signal: controller.signal })
+          if (!response.ok || response.body === null) return
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            let newline = buffer.indexOf('\n')
+            while (newline >= 0) {
+              const line = buffer.slice(0, newline).trim()
+              buffer = buffer.slice(newline + 1)
+              if (line.length > 0) {
+                const entry = JSON.parse(line)
+                if (entry.runId === runId) setRun((previous) => reduceEvent(previous, entry.event))
+              }
+              newline = buffer.indexOf('\n')
+            }
+          }
+        } catch {
+          /* a detached reader is expected; the run continues on the Host */
+        } finally {
+          if (readerRef.current === controller) readerRef.current = null
+        }
+      }, [])
+
+      /** Pull the Host's current run; re-attach while it is still running. */
+      const syncState = useCallback(async () => {
+        const response = await fetch('/api/llm-bench/state', { cache: 'no-store' })
+        if (!response.ok) throw new Error(tr('unavailable'))
+        const snapshot = await response.json()
+        applySnapshot(snapshot, false)
+        if (snapshot.status === 'running') void attach(snapshot.lastSeq + 1, snapshot.runId)
+        return snapshot
+      }, [applySnapshot, attach])
 
       useEffect(() => {
         let cancelled = false
@@ -430,9 +505,7 @@ window.__ModuleLoader__.load({
             setCatalog(data)
             setProvider((current) => (current.length > 0 ? current : data.defaults?.provider ?? ''))
             setModel((current) => (current.length > 0 ? current : data.defaults?.model ?? ''))
-            if (typeof data.outputTokens === 'number') {
-              setOutputTokens((current) => (saved !== null && typeof saved?.outputTokens === 'number' ? current : data.outputTokens))
-            }
+            if (typeof data.outputTokens === 'number' && typeof savedForm.outputTokens !== 'number') setOutputTokens(data.outputTokens)
           })
           .catch((failure) => {
             if (!cancelled) setLoadError(failure instanceof Error ? failure.message : String(failure))
@@ -440,22 +513,39 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
         }
-        // The catalog is fetched once per panel lifetime; restored inputs win over defaults.
+        // Fetched once per panel lifetime; restored inputs win over defaults.
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [])
 
-      useEffect(
-        () => () => {
-          if (abortRef.current !== null) abortRef.current.abort()
-          if (copiedTimer.current !== null) clearTimeout(copiedTimer.current)
-        },
-        [],
-      )
-
-      // Keep the last run on this machine: closing the panel or reloading the page must not lose it.
+      // Adopt the Host's run on mount: it may still be running from another panel visit.
       useEffect(() => {
-        writeStore({ provider, model, sizesText, outputTokens, repeats, needle, ceilingText, tolerance, results, summary, steps, declaredWindow })
-      }, [provider, model, sizesText, outputTokens, repeats, needle, ceilingText, tolerance, results, summary, steps, declaredWindow])
+        let cancelled = false
+        const stored = saved !== null && typeof saved.lastRun === 'object' && saved.lastRun !== null ? saved.lastRun : null
+        syncState()
+          .then((snapshot) => {
+            if (cancelled) return
+            if (snapshot.status === 'idle' && stored !== null) applySnapshot(stored, true)
+          })
+          .catch(() => {
+            if (cancelled) return
+            if (stored !== null) applySnapshot(stored, true)
+          })
+        return () => {
+          cancelled = true
+          if (readerRef.current !== null) readerRef.current.abort()
+          if (copiedTimer.current !== null) clearTimeout(copiedTimer.current)
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [])
+
+      // Persist the form always, and the last finished run for a Host restart.
+      useEffect(() => {
+        const finished = run !== null && run.status !== 'running' && run.runId !== null ? run : null
+        writeStore({
+          form: { provider, model, sizesText, outputTokens, repeats, needle, ceilingText, tolerance },
+          lastRun: finished !== null ? finished : saved !== null && typeof saved.lastRun === 'object' ? saved.lastRun : null,
+        })
+      }, [provider, model, sizesText, outputTokens, repeats, needle, ceilingText, tolerance, run, saved])
 
       const providers = catalog === null ? [] : catalog.providers ?? []
       const models = useMemo(() => {
@@ -477,34 +567,21 @@ window.__ModuleLoader__.load({
         [providers],
       )
 
-      const stop = useCallback(() => {
-        if (abortRef.current !== null) abortRef.current.abort()
-      }, [])
+      const running = run !== null && run.status === 'running'
 
       const start = useCallback(
         async (action) => {
-          if (running !== null) return
+          if (running) return
           if (provider.length === 0 || model.length === 0) {
-            setError(tr('noRoute'))
+            setActionError(tr('noRoute'))
             return
           }
           const sizes = action === 'sweep' ? parseSizes(sizesText) : []
           if (action === 'sweep' && sizes.length === 0) {
-            setError(tr('invalidSizes'))
+            setActionError(tr('invalidSizes'))
             return
           }
-          setError(null)
-          setSummary(null)
-          setProgress(tr('starting'))
-          if (action === 'sweep') {
-            setResults([])
-            setSteps([])
-          } else {
-            setSteps([])
-          }
-          setRunning(action)
-          const controller = new AbortController()
-          abortRef.current = controller
+          setActionError(null)
           const body = action === 'sweep'
             ? { action, provider, model, sizes, outputTokens, repeats, needle }
             : {
@@ -515,95 +592,71 @@ window.__ModuleLoader__.load({
                 ...(Number(ceilingText) > 0 ? { ceilingTokens: Math.round(Number(ceilingText)) } : {}),
               }
           try {
-            await streamRun(
-              body,
-              (event) => {
-                switch (event.type) {
-                  case 'start':
-                    setDeclaredWindow(event.declaredContextWindow ?? null)
-                    setProgress(`${tr('onRoute')} ${event.provider}/${event.model}…`)
-                    break
-                  case 'run-start':
-                    setProgress(`${formatInt(event.targetTokens)} ${tr('tokens')}…`)
-                    break
-                  case 'run':
-                    setResults((current) => [...current, event.result])
-                    setProgress(
-                      `${formatInt(event.result.targetTokens)} ${tr('tokens')}: ${formatMs(event.result.ttftMs)} → ${formatRate(event.result.decodeTokPerSec)}`,
-                    )
-                    break
-                  case 'probe-start':
-                    setProgress(
-                      `${tr('probeOf')} ${event.probe} ${tr('ofProbes')} ${event.of}: ${formatInt(event.targetTokens)} ${tr('tokens')}`,
-                    )
-                    break
-                  case 'probe':
-                    setSteps((current) => [...current, event.step])
-                    setProgress(
-                      `${tr('probeOf')} ${event.step.probe}: ${
-                        event.step.outcome === 'pass'
-                          ? tr('outcomePass')
-                          : event.step.outcome === 'context'
-                            ? tr('outcomeContext')
-                            : tr('outcomeFatal')
-                      }`,
-                    )
-                    break
-                  case 'summary':
-                    setSummary(event.summary)
-                    break
-                  case 'error':
-                    setError(event.message)
-                    break
-                  case 'done':
-                    setProgress(null)
-                    break
-                  default:
-                    break
-                }
-              },
-              controller.signal,
-            )
-          } catch (failure) {
-            if (!controller.signal.aborted) {
-              setError(failure instanceof Error ? failure.message : String(failure))
+            const response = await fetch('/api/llm-bench/run', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body),
+            })
+            const payload = await response.json().catch(() => null)
+            if (response.status === 409) {
+              setActionError(tr('busy'))
+              await syncState()
+              return
             }
-          } finally {
-            abortRef.current = null
-            setRunning(null)
-            setProgress(null)
+            if (!response.ok) {
+              throw new Error(payload !== null && typeof payload?.error === 'string' ? payload.error : `HTTP ${response.status}`)
+            }
+            applySnapshot(payload, false)
+            void attach(payload.lastSeq + 1, payload.runId)
+          } catch (failure) {
+            setActionError(failure instanceof Error ? failure.message : String(failure))
           }
         },
-        [running, provider, model, sizesText, outputTokens, repeats, needle, ceilingText, tolerance],
+        [running, provider, model, sizesText, outputTokens, repeats, needle, ceilingText, tolerance, applySnapshot, attach, syncState],
       )
 
+      const stop = useCallback(async () => {
+        try {
+          await fetch('/api/llm-bench/stop', { method: 'POST' })
+        } catch (failure) {
+          setActionError(failure instanceof Error ? failure.message : String(failure))
+        }
+      }, [])
+
       const clear = useCallback(() => {
-        if (abortRef.current !== null) abortRef.current.abort()
-        setResults([])
-        setSteps([])
-        setSummary(null)
-        setError(null)
-        setProgress(null)
+        setRun(null)
+        setActionError(null)
+        setRestored(false)
+        try {
+          window.localStorage.removeItem(STORE_KEY)
+        } catch {
+          /* ignore */
+        }
       }, [])
 
       const copy = useCallback(async () => {
         try {
-          await navigator.clipboard.writeText(JSON.stringify({ provider, model, declaredWindow, results, summary, steps }, null, 2))
+          await navigator.clipboard.writeText(JSON.stringify({ provider, model, run }, null, 2))
           setCopied(true)
           if (copiedTimer.current !== null) clearTimeout(copiedTimer.current)
           copiedTimer.current = setTimeout(() => setCopied(false), 1500)
         } catch {
           setCopied(false)
         }
-      }, [provider, model, declaredWindow, results, summary, steps])
+      }, [provider, model, run])
 
-      const disabled = running !== null
+      const results = run === null ? [] : run.results
+      const steps = run === null ? [] : run.steps
+      const summary = run === null ? null : run.summary
+      const progress = run === null ? null : run.progress
+      const declaredWindow = run === null ? null : run.declaredContextWindow
+      const errorText = actionError ?? (run === null ? null : run.error)
+      const hasOutput = results.length > 0 || steps.length > 0 || summary !== null
       const presets = [
         { label: '1k–64k', value: '1000, 4000, 16000, 64000' },
         { label: '20k–200k', value: '20000, 50000, 100000, 200000' },
         { label: '1M', value: '1000000' },
       ]
-      const hasOutput = results.length > 0 || steps.length > 0 || summary !== null
 
       return h(
         'div',
@@ -617,7 +670,7 @@ window.__ModuleLoader__.load({
             { className: 'llmb-titlerow' },
             h('h1', { className: 'llmb-title' }, tr('title')),
             h('span', { className: 'llmb-headspacer' }),
-            progress === null ? null : h('span', { className: 'llmb-live' }, progress),
+            running ? h('span', { className: 'llmb-live' }, progressText(progress) ?? tr('starting')) : null,
           ),
           h('p', { className: 'llmb-sub' }, tr('subtitle')),
         ),
@@ -640,7 +693,7 @@ window.__ModuleLoader__.load({
                   h('span', null, tr('provider')),
                   h(
                     'select',
-                    { className: 'llmb-input', value: provider, onChange: onProviderChange, disabled },
+                    { className: 'llmb-input', value: provider, onChange: onProviderChange, disabled: running },
                     ...providers.map((entry) => h('option', { key: entry.id, value: entry.id }, entry.name ?? entry.id)),
                   ),
                 ),
@@ -650,7 +703,7 @@ window.__ModuleLoader__.load({
                   h('span', null, tr('model')),
                   h(
                     'select',
-                    { className: 'llmb-input', value: model, onChange: (event) => setModel(event.target.value), disabled },
+                    { className: 'llmb-input', value: model, onChange: (event) => setModel(event.target.value), disabled: running },
                     ...models.map((entry) => h('option', { key: entry.id, value: entry.id }, entry.name ?? entry.id)),
                   ),
                 ),
@@ -678,7 +731,7 @@ window.__ModuleLoader__.load({
                   value: sizesText,
                   spellCheck: false,
                   onChange: (event) => setSizesText(event.target.value),
-                  disabled,
+                  disabled: running,
                 }),
               ),
               h(
@@ -687,7 +740,7 @@ window.__ModuleLoader__.load({
                 ...presets.map((preset, index) =>
                   h(
                     'button',
-                    { key: index, type: 'button', className: 'llmb-chip', disabled, onClick: () => setSizesText(preset.value) },
+                    { key: index, type: 'button', className: 'llmb-chip', disabled: running, onClick: () => setSizesText(preset.value) },
                     preset.label,
                   ),
                 ),
@@ -707,7 +760,7 @@ window.__ModuleLoader__.load({
                     max: 2048,
                     value: outputTokens,
                     onChange: (event) => setOutputTokens(Math.max(1, Math.min(2048, Math.round(Number(event.target.value) || 1)))),
-                    disabled,
+                    disabled: running,
                   }),
                 ),
                 h(
@@ -721,7 +774,7 @@ window.__ModuleLoader__.load({
                     max: 5,
                     value: repeats,
                     onChange: (event) => setRepeats(Math.max(1, Math.min(5, Math.round(Number(event.target.value) || 1)))),
-                    disabled,
+                    disabled: running,
                   }),
                 ),
                 h(
@@ -731,7 +784,7 @@ window.__ModuleLoader__.load({
                     type: 'checkbox',
                     checked: needle,
                     onChange: (event) => setNeedle(event.target.checked),
-                    disabled,
+                    disabled: running,
                   }),
                   h('span', null, tr('needle')),
                 ),
@@ -751,7 +804,7 @@ window.__ModuleLoader__.load({
                     placeholder: tr('probeCeilingAuto'),
                     value: ceilingText,
                     onChange: (event) => setCeilingText(event.target.value),
-                    disabled,
+                    disabled: running,
                   }),
                 ),
                 h(
@@ -764,23 +817,25 @@ window.__ModuleLoader__.load({
                     min: 64,
                     value: tolerance,
                     onChange: (event) => setTolerance(Math.max(64, Math.round(Number(event.target.value) || 512))),
-                    disabled,
+                    disabled: running,
                   }),
                 ),
               ),
               h(
                 'div',
                 { className: 'llmb-actions' },
-                h('button', { type: 'button', className: 'llmb-btn llmb-primary', disabled, onClick: () => start('sweep') }, tr('runSweep')),
-                h('button', { type: 'button', className: 'llmb-btn', disabled, onClick: () => start('probe') }, tr('probe')),
-                running === null ? null : h('button', { type: 'button', className: 'llmb-btn llmb-danger', onClick: stop }, tr('stop')),
+                h('button', { type: 'button', className: 'llmb-btn llmb-primary', disabled: running, onClick: () => start('sweep') }, tr('runSweep')),
+                h('button', { type: 'button', className: 'llmb-btn', disabled: running, onClick: () => start('probe') }, tr('probe')),
+                running ? h('button', { type: 'button', className: 'llmb-btn llmb-danger', onClick: stop }, tr('stop')) : null,
               ),
-              error === null ? null : h('div', { className: 'llmb-error' }, error),
+              errorText === null ? null : h('div', { className: 'llmb-error' }, errorText),
+              restored ? h('div', { className: 'llmb-note' }, tr('restored')) : null,
+              run !== null && run.status === 'stopped' ? h('p', { className: 'llmb-hint' }, tr('stoppedHint')) : null,
+              h('p', { className: 'llmb-note' }, tr('runKeepsHint')),
               h('p', { className: 'llmb-note' }, tr('costNote')),
-              h('p', { className: 'llmb-note' }, tr('leavingHint')),
             ),
             steps.length > 0 || (summary !== null && summary.action === 'probe')
-              ? h(ProbeSummary, { summary: summary !== null && summary.action === 'probe' ? summary : null, liveSteps: steps, declaredWindow })
+              ? h(ProbeSummary, { summary: summary !== null && summary.action === 'probe' ? summary : null, steps, declaredWindow })
               : null,
             results.length > 0 ? h(ResultsTable, { results }) : null,
             hasOutput ? null : h('p', { className: 'llmb-note' }, tr('noResults')),
@@ -788,7 +843,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'llmb-actions' },
               h('button', { type: 'button', className: 'llmb-btn', disabled: !hasOutput, onClick: copy }, copied ? tr('copied') : tr('copy')),
-              h('button', { type: 'button', className: 'llmb-btn', disabled: !hasOutput || disabled, onClick: clear }, tr('clear')),
+              h('button', { type: 'button', className: 'llmb-btn', disabled: !hasOutput || running, onClick: clear }, tr('clear')),
             ),
           ),
         ),
