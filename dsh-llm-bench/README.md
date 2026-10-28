@@ -12,17 +12,20 @@ directory).
 This directory is a DSH bundle package (`package.json` → `dsh.bundle.patch`), so it is
 installed by path, not by copying files into the profile: give its absolute path to the
 Plugin Manager's `install_bundle` action. That links the checkout into the profile, inserts
-one Loader row (`llm-bench`), and activates the `llm_bench` tool plus the
-Settings → Model Bench page. Host code changes then need a disable/enable cycle; browser code
-changes need a page refresh.
+one Loader row (`llm-bench`), and activates the `llm_bench` tool plus the **Model Bench**
+side panel (gauge icon in the sidebar panel row). Host code changes then need a
+disable/enable cycle; browser code changes need a page refresh.
 
 ## Two entry points, one core
 
 Both drive `bench.js`, so the agent and the page report identical numbers.
 
 - **Agent tool `llm_bench`** — actions `catalog`, `sweep`, `probe`, `generate`.
-- **Settings → Model Bench** — the same sweeps and probes with a live table, a stop
-  button, and a JSON copy of the last run.
+- **Sidebar panel (Model Bench)** — the same sweeps and probes with a live table, a stop
+  button, and a JSON copy of the last run. It is its own main-column panel, not a Settings
+  page: the last run stays on screen when you open it again, and inputs plus results are
+  written to `localStorage` (`dsh-llm-bench:v1`) and restored after a page reload. Switching
+  to another panel stops a running measurement; what it collected so far is kept.
 
 ## What is measured
 
